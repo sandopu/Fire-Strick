@@ -15,11 +15,393 @@ jobs:
           java-version: 17
       - name: Accept Android SDK Licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - name: Ensure App Module Exists
+        run: |
+          if [ ! -f app/build.gradle.kts ]; then
+            NESTED=$(find . -maxdepth 3 -path "*/app/build.gradle.kts" | head -n 1)
+            if [ -n "$NESTED" ]; then
+              cp -r "$(dirname "$NESTED")" ./app
+            else
+              mkdir -p app/src/main/java/com/firepad/remote
+              cat <<'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.firepad.remote"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.firepad.remote"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+              implementation("androidx.activity:activity-compose:1.10.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          EOF
+              cat <<'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <application
+                  android:allowBackup="true"
+                  android:label="FirePad Remote"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+              cat <<'EOF' > app/src/main/java/com/firepad/remote/FireTvClient.kt
+          package com.firepad.remote
+
+          import android.content.Context
+          import android.net.wifi.WifiManager
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONObject
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.security.SecureRandom
+          import java.security.cert.X509Certificate
+          import java.util.concurrent.TimeUnit
+          import javax.net.ssl.SSLContext
+          import javax.net.ssl.TrustManager
+          import javax.net.ssl.X509TrustManager
+
+          data class CommandStatus(val ok: Boolean, val via: String = "", val error: String? = null)
+
+          class FireTvClient(private val context: Context) {
+              companion object {
+                  private const val API_KEY = "0987654321"
+                  private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+              }
+
+              private val client: OkHttpClient by lazy {
+                  val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
+                      override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+                      override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+                      override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+                  })
+                  val sslContext = SSLContext.getInstance("TLS")
+                  sslContext.init(null, trustAll, SecureRandom())
+                  OkHttpClient.Builder()
+                      .sslSocketFactory(sslContext.socketFactory, trustAll[0] as X509TrustManager)
+                      .hostnameVerifier { _, _ -> true }
+                      .connectTimeout(3, TimeUnit.SECONDS)
+                      .readTimeout(4, TimeUnit.SECONDS)
+                      .build()
+              }
+
+              suspend fun discoverFireSticks(): List<String> = withContext(Dispatchers.IO) {
+                  val found = linkedSetOf<String>()
+                  val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                  val lock = wifi.createMulticastLock("firepad_ssdp").apply { acquire() }
+                  try {
+                      val socket = DatagramSocket()
+                      socket.soTimeout = 1400
+                      val payload = (
+                          "M-SEARCH * HTTP/1.1\r\n" +
+                          "HOST: 239.255.255.250:1900\r\n" +
+                          "MAN: \"ssdp:discover\"\r\n" +
+                          "MX: 1\r\n" +
+                          "ST: urn:dial-multiscreen-org:service:dial:1\r\n\r\n"
+                      ).toByteArray()
+                      val group = InetAddress.getByName("239.255.255.250")
+                      socket.send(DatagramPacket(payload, payload.size, group, 1900))
+                      val buf = ByteArray(2048)
+                      val deadline = System.currentTimeMillis() + 1500
+                      while (System.currentTimeMillis() < deadline) {
+                          try {
+                              val pkt = DatagramPacket(buf, buf.size)
+                              socket.receive(pkt)
+                              val ip = pkt.address?.hostAddress
+                              if (!ip.isNullOrBlank() && isPortOpen(ip, 8080, 450)) {
+                                  found.add(ip)
+                              }
+                          } catch (_: Exception) {
+                              break
+                          }
+                      }
+                      socket.close()
+                  } finally {
+                      if (lock.isHeld) lock.release()
+                  }
+                  found.toList()
+              }
+
+              private fun isPortOpen(ip: String, port: Int, timeoutMs: Int): Boolean {
+                  return try {
+                      Socket().use { s ->
+                          s.connect(InetSocketAddress(ip, port), timeoutMs)
+                          true
+                      }
+                  } catch (_: Exception) {
+                      false
+                  }
+              }
+
+              private fun post(host: String, path: String, token: String? = null, body: JSONObject = JSONObject()): Pair<Int, String> {
+                  val urls = listOf("https://$host:8080$path", "http://$host:8080$path")
+                  var lastErr = "Unreachable"
+                  for (url in urls) {
+                      try {
+                          val builder = Request.Builder()
+                              .url(url)
+                              .header("X-Api-Key", API_KEY)
+                              .post(body.toString().toRequestBody(JSON_MEDIA))
+                          if (!token.isNullOrBlank()) builder.header("X-Client-Token", token)
+                          client.newCall(builder.build()).execute().use { resp ->
+                              return Pair(resp.code, resp.body?.string().orEmpty())
+                          }
+                      } catch (e: Exception) {
+                          lastErr = e.message ?: "Network error"
+                      }
+                  }
+                  return Pair(500, lastErr)
+              }
+
+              suspend fun requestPin(host: String): CommandStatus = withContext(Dispatchers.IO) {
+                  try {
+                      val wake = Request.Builder().url("http://$host:8009/apps/FireTVRemote").post("".toRequestBody()).build()
+                      runCatching { client.newCall(wake).execute().close() }
+                      delay(500)
+                  } catch (_: Exception) {}
+                  val (code, raw) = post(host, "/v1/FireTV/pin/display", null, JSONObject().put("friendlyName", "FirePad Android"))
+                  if (code in 200..299) CommandStatus(true, "pin_display") else CommandStatus(false, error = "HTTP $code: $raw")
+              }
+
+              suspend fun verifyPin(host: String, pin: String): Pair<String?, String?> = withContext(Dispatchers.IO) {
+                  val (code, raw) = post(host, "/v1/FireTV/pin/verify", null, JSONObject().put("pin", pin))
+                  val token = runCatching { JSONObject(raw).optString("description") }.getOrNull()
+                  if (code in 200..299 && !token.isNullOrBlank()) Pair(token, null) else Pair(null, "Verification failed ($code)")
+              }
+
+              suspend fun sendKey(host: String, token: String, action: String): CommandStatus = withContext(Dispatchers.IO) {
+                  val (code, raw) = post(host, "/v1/FireTV?action=$action", token)
+                  if (code in 200..299) CommandStatus(true, "lightning") else CommandStatus(false, error = "HTTP $code: $raw")
+              }
+
+              suspend fun openSettings(host: String, token: String): CommandStatus = withContext(Dispatchers.IO) {
+                  val (actCode, actRaw) = post(host, "/v1/FireTV?action=settings", token)
+                  if (actCode in 200..299 && !actRaw.contains("error", true)) {
+                      return@withContext CommandStatus(true, "lightning_action")
+                  }
+                  val pkgs = listOf("com.amazon.tv.settings.v2", "com.amazon.tv.settings", "com.amazon.vega.settings", "com.android.tv.settings")
+                  for (pkg in pkgs) {
+                      val (c, _) = post(host, "/v1/FireTV/app/$pkg", token)
+                      if (c in 200..299) return@withContext CommandStatus(true, "pkg:$pkg")
+                  }
+                  val (downCode, _) = post(host, "/v1/FireTV?action=home", token, JSONObject().put("keyAction", JSONObject().put("keyActionType", "keyDown")))
+                  if (downCode in 200..299) {
+                      delay(1150)
+                      post(host, "/v1/FireTV?action=home", token, JSONObject().put("keyAction", JSONObject().put("keyActionType", "keyUp")))
+                      delay(650)
+                      repeat(4) {
+                          post(host, "/v1/FireTV?action=dpad_right", token)
+                          delay(140)
+                      }
+                      delay(150)
+                      post(host, "/v1/FireTV?action=select", token)
+                      return@withContext CommandStatus(true, "quick_menu_macro")
+                  }
+                  CommandStatus(false, error = "Unable to open Settings")
+              }
+
+              suspend fun sendVolume(host: String, token: String, kind: String): CommandStatus = withContext(Dispatchers.IO) {
+                  val paths = when (kind) {
+                      "VOL_UP" -> listOf("/v1/FireTV?action=volume_up", "/v1/media?action=volume_up", "/v1/FireTV?action=vol_up", "/v1/FireTV/volume?action=up")
+                      "VOL_DOWN" -> listOf("/v1/FireTV?action=volume_down", "/v1/media?action=volume_down", "/v1/FireTV?action=vol_down", "/v1/FireTV/volume?action=down")
+                      else -> listOf("/v1/FireTV?action=mute", "/v1/media?action=mute", "/v1/FireTV/volume?action=mute")
+                  }
+                  for (p in paths) {
+                      val (code, raw) = post(host, p, token)
+                      if (code in 200..299 && !raw.contains("error", true)) {
+                          return@withContext CommandStatus(true, "lightning:$p")
+                      }
+                  }
+                  CommandStatus(false, error = "Enable HDMI-CEC Device Control in TV Settings > Display & Sounds.")
+              }
+
+              suspend fun openDisplayMirroring(
+                  host: String,
+                  token: String,
+                  displayTileOffset: Int = 3,
+                  mirrorRowOffset: Int = 3
+              ): CommandStatus = withContext(Dispatchers.IO) {
+                  val opened = openSettings(host, token)
+                  if (!opened.ok) return@withContext opened
+                  delay(950)
+                  repeat(displayTileOffset) {
+                      post(host, "/v1/FireTV?action=dpad_right", token)
+                      delay(160)
+                  }
+                  post(host, "/v1/FireTV?action=select", token)
+                  delay(800)
+                  repeat(mirrorRowOffset) {
+                      post(host, "/v1/FireTV?action=dpad_down", token)
+                      delay(160)
+                  }
+                  post(host, "/v1/FireTV?action=select", token)
+                  CommandStatus(true, "settings_display_mirroring")
+              }
+          }
+          EOF
+              cat <<'EOF' > app/src/main/java/com/firepad/remote/MainActivity.kt
+          package com.firepad.remote
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val client = FireTvClient(this)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          FirePadScreen(client)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FirePadScreen(client: FireTvClient) {
+              val scope = rememberCoroutineScope()
+              var host by remember { mutableStateOf("") }
+              var pin by remember { mutableStateOf("") }
+              var token by remember { mutableStateOf("") }
+              var status by remember { mutableStateOf("Scan Wi-Fi or enter Fire Stick IP") }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Color(0xFF0B0D12))
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp)
+              ) {
+                  Text("FirePad Remote", style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.Bold)
+                  Text(status, color = Color(0xFFFF6B2C), style = MaterialTheme.typography.bodySmall)
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedTextField(value = host, onValueChange = { host = it }, label = { Text("Firestick IP") }, modifier = Modifier.weight(1f), singleLine = true)
+                      Button(onClick = {
+                          scope.launch {
+                              status = "Scanning Wi-Fi..."
+                              val list = client.discoverFireSticks()
+                              if (list.isNotEmpty()) {
+                                  host = list.first()
+                                  status = "Found Firestick: $host"
+                              } else status = "No Firestick found via SSDP"
+                          }
+                      }) { Text("Scan") }
+                  }
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = {
+                          scope.launch {
+                              val r = client.requestPin(host)
+                              status = if (r.ok) "Enter the 4-digit PIN shown on TV" else (r.error ?: "PIN failed")
+                          }
+                      }) { Text("Send PIN") }
+                      OutlinedTextField(value = pin, onValueChange = { pin = it }, label = { Text("PIN") }, modifier = Modifier.weight(1f), singleLine = true)
+                      Button(onClick = {
+                          scope.launch {
+                              val (tok, err) = client.verifyPin(host, pin)
+                              if (tok != null) { token = tok; status = "Paired with $host" } else status = err ?: "Verify failed"
+                          }
+                      }) { Text("Verify") }
+                  }
+
+                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Button(onClick = { scope.launch { status = client.openSettings(host, token).let { if (it.ok) "Opened Settings" else it.error ?: "Error" } } }) { Text("Settings") }
+                          Button(onClick = {
+                              scope.launch {
+                                  status = "Navigating Settings -> Display -> Enable Display Mirroring..."
+                                  val r = client.openDisplayMirroring(host, token)
+                                  status = if (r.ok) "Display Mirroring opened" else (r.error ?: "Failed")
+                              }
+                          }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF6B2C))) { Text("Cast / Mirror") }
+                      }
+
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Button(onClick = { scope.launch { client.sendKey(host, token, "dpad_up") } }) { Text("▲") }
+                          Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              Button(onClick = { scope.launch { client.sendKey(host, token, "dpad_left") } }) { Text("◀") }
+                              Button(onClick = { scope.launch { client.sendKey(host, token, "select") } }, shape = CircleShape) { Text("OK") }
+                              Button(onClick = { scope.launch { client.sendKey(host, token, "dpad_right") } }) { Text("▶") }
+                          }
+                          Button(onClick = { scope.launch { client.sendKey(host, token, "dpad_down") } }) { Text("▼") }
+                      }
+
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Button(onClick = { scope.launch { status = client.sendVolume(host, token, "VOL_UP").error ?: "Volume +" } }) { Text("Vol +") }
+                          Button(onClick = { scope.launch { status = client.sendVolume(host, token, "MUTE").error ?: "Muted" } }) { Text("Mute") }
+                          Button(onClick = { scope.launch { status = client.sendVolume(host, token, "VOL_DOWN").error ?: "Volume -" } }) { Text("Vol -") }
+                      }
+                  }
+
+                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = { scope.launch { client.sendKey(host, token, "back") } }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)) { Text("Back") }
+                      Button(onClick = { scope.launch { client.sendKey(host, token, "home") } }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)) { Text("Home") }
+                      Button(onClick = { scope.launch { client.sendKey(host, token, "menu") } }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)) { Text("Menu") }
+                  }
+              }
+          }
+          EOF
+            fi
+          fi
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.11.1
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+        run: gradle :app:assembleDebug --no-daemon
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
